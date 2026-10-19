@@ -56,6 +56,7 @@ svg { display: block; }
 .sprite { position: absolute; width: 0; height: 0; overflow: hidden; }
 
 #app { height: 100%; max-width: 480px; margin: 0 auto; padding-inline: 16px; position: relative; overflow: hidden; overflow: clip; }
+@supports (height: 100dvh) { #app { height: 100dvh; } }
 .backdrop { position: absolute; inset: 0; overflow: hidden; overflow: clip; pointer-events: none; }
 .rays {
   position: absolute; inset: 0; pointer-events: none;
@@ -65,6 +66,9 @@ svg { display: block; }
 #fx { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 30; }
 .screen-view { position: relative; z-index: 1; height: 100%; display: flex; flex-direction: column; justify-content: space-between; gap: 8px; padding-block: 10px; }
 .screen-view > * { flex-shrink: 0; }
+/* if a phone is too short for a screen, the column scrolls and the action row stays pinned at the bottom: nothing is ever out of reach */
+#game { overflow-y: auto; overscroll-behavior: contain; }
+#game > #actions { position: sticky; bottom: 0; z-index: 7; padding-top: 6px; background: linear-gradient(180deg, rgba(10, 4, 32, 0), var(--night) 45%); }
 #below { flex: 0 1 auto; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
 #below > * { flex-shrink: 0; }
 /* in the store the detail sits in the shrinkable slot: its text scrolls on a short phone, its buttons never leave */
@@ -2435,7 +2439,9 @@ const Engine = (() => {
     s.phase = 'shop';
   }
 
-  function shopper(s) { return s.shop.order[s.shop.idx]; }
+  function shopper(s, who) { return who === undefined || who === null ? s.shop.order[s.shop.idx] : who; }
+  /* A simultaneous store (two phones): both players shop at once, each marks Done, and the spins start when both have. */
+  function shopDone(s, who) { return !!(s.shop && s.shop.done && s.shop.done[who]); }
   /* Three augments of a tier the player does not already own. */
   function augOffer(p, tier, rng) {
     const pool = AUG_IDS.filter(id => AUGS[id].tier === tier && !has(p, id)), out = [];
@@ -2443,12 +2449,12 @@ const Engine = (() => {
     return out;
   }
   /* Take one of the offered augments. Some act at once; the rest are checked where they matter. */
-  function pickAug(s, id) {
+  function pickAug(s, id, who) {
     if (s.phase !== 'shop') return null;
-    const p = s.players[shopper(s)];
+    const p = s.players[shopper(s, who)];
     if (!p.augOffer || p.augOffer.indexOf(id) < 0) return null;
     p.augOffer = null; p.augs.push(id);
-    const ev = { aug: id, player: shopper(s) };
+    const ev = { aug: id, player: shopper(s, who) };
     if (id === 'hold2') { p.holds += 1; p.chips += 2; }
     if (id === 'holdall') p.holds += 1;
     if (id === 'cash4') p.chips += 3;
@@ -2469,26 +2475,26 @@ const Engine = (() => {
   function upgradePrice(p) { return p.upgrades < CFG.upgradeCost.length ? Math.max(1, CFG.upgradeCost[p.upgrades] - (has(p, 'mechanic') ? 3 : 0)) : null; }
   function shredPrice(p) { return has(p, 'scrap') ? 2 : CFG.shredCost; }
 
-  function buy(s, i) {
+  function buy(s, i, who) {
     if (s.phase !== 'shop') return null;
-    const p = s.players[shopper(s)], slot = p.store[i];
+    const p = s.players[shopper(s, who)], slot = p.store[i];
     if (p.augOffer) return null;
     if (!slot || p.chips < costOf(slot.k, p, slot)) return null;
     p.chips -= costOf(slot.k, p, slot);
     p.buys = (p.buys || 0) + 1;
     p.store[i] = null;
-    if (KINDS[slot.k].fam === 'key') { p.keys = (p.keys || 0) + 1; return { kind: 'key', fused: 0, player: shopper(s), slot: i, key: true }; }
+    if (KINDS[slot.k].fam === 'key') { p.keys = (p.keys || 0) + 1; return { kind: 'key', fused: 0, player: shopper(s, who), slot: i, key: true }; }
     const gold = p.goldTouch && FAMS.indexOf(KINDS[slot.k].fam) >= 0 && KINDS[slot.k].rar === 'c';
     if (gold) p.goldTouch = 0;
     const ev = addToBag(p, slot.k, gold ? 1 : 0, has(p, 'crownjewel'), has(p, 'welder'));
-    ev.player = shopper(s); ev.slot = i; if (gold) ev.gold = true;
+    ev.player = shopper(s, who); ev.slot = i; if (gold) ev.gold = true;
     if (ev.fused && KINDS[slot.k].rar === 'l') { const f = KINDS[slot.k].fam; p.asc = p.asc || {}; if (!p.asc[f]) { p.asc[f] = true; ev.ascend = f; } }
     if (ev.fused === 2 && FAMS.indexOf(KINDS[slot.k].fam) >= 0 && !p.mega) { p.mega = KINDS[slot.k].fam; ev.mega = p.mega; }   // the first Mega transforms the machine
     return ev;
   }
-  function reroll(s, rng) {
+  function reroll(s, rng, who) {
     if (s.phase !== 'shop') return false;
-    const p = s.players[shopper(s)];
+    const p = s.players[shopper(s, who)];
     if (p.augOffer) return false;
     if (p.freeReroll) p.freeReroll = 0;
     else { if (p.chips < CFG.rerollCost) return false; p.chips -= CFG.rerollCost; }
@@ -2496,9 +2502,9 @@ const Engine = (() => {
     return true;
   }
   /* Held pieces stay in your store next round while the rest refresh. One hold to start; a Key adds another. */
-  function lock(s, i) {
+  function lock(s, i, who) {
     if (s.phase !== 'shop') return false;
-    const p = s.players[shopper(s)], slot = p.store[i];
+    const p = s.players[shopper(s, who)], slot = p.store[i];
     if (!slot || p.augOffer) return false;
     if (slot.locked) { slot.locked = false; return true; }
     const held = p.store.filter(x => x && x.locked);
@@ -2509,37 +2515,43 @@ const Engine = (() => {
   /* What a piece sells for: nothing for a plain common or any slime, more for fused and rarer pieces. */
   function sellValue(slot) { return KINDS[slot.k].fam === 'slime' ? 0 : CFG.sellTable[slot.t][KINDS[slot.k].rar]; }
   /* Sell any bought piece back. */
-  function sell(s, i) {
+  function sell(s, i, who) {
     if (s.phase !== 'shop') return null;
-    const p = s.players[shopper(s)], slot = p.bag[i];
+    const p = s.players[shopper(s, who)], slot = p.bag[i];
     if (!slot || p.augOffer || KINDS[slot.k].fam === 'junk') return null;
     p.bag.splice(i, 1);
     p.chips += sellValue(slot);
     return { kind: slot.k, tier: slot.t };
   }
   function cardsLeft(p) { let n = 0; for (const s of p.bag) if (KINDS[s.k].fam === 'junk') n += 1; return n; }
-  function shred(s) {
+  function shred(s, who) {
     if (s.phase !== 'shop' || !CFG.shredCost) return false;
-    const p = s.players[shopper(s)];
+    const p = s.players[shopper(s, who)];
     if (p.augOffer || p.chips < shredPrice(p) || cardsLeft(p) <= CFG.cardFloor) return false;
     const i = p.bag.findIndex(x => KINDS[x.k].fam === 'junk');
     p.bag.splice(i, 1); p.chips -= shredPrice(p);
     return true;
   }
-  function upgrade(s) {
+  function upgrade(s, who) {
     if (s.phase !== 'shop') return false;
-    const p = s.players[shopper(s)], price = upgradePrice(p);
+    const p = s.players[shopper(s, who)], price = upgradePrice(p);
     if (p.augOffer || price === null || p.chips < price) return false;
     p.chips -= price; p.upgrades += 1;
     return true;
   }
-  function endShop(s) {
+  function endShop(s, who) {
     if (s.phase !== 'shop') return;
-    const p = s.players[shopper(s)];
+    const p = s.players[shopper(s, who)];
     if (p.augOffer) return;   // the pick comes first
     if (has(p, 'piggy')) p.nextChips += Math.min(5, p.chips);
     p.chips = 0;
-    s.shop.idx += 1;
+    if (who !== undefined && who !== null) {   // simultaneous: this one is done; the spins start when both are
+      s.shop.done = s.shop.done || [false, false];
+      if (s.shop.done[who]) return;
+      s.shop.done[who] = true;
+      if (!(s.shop.done[0] && s.shop.done[1])) return;
+      s.shop.idx = 2;
+    } else s.shop.idx += 1;
     if (s.shop.idx >= 2) {
       const first = s.shop.order[1];            // whoever shopped first spins last
       s.spin = { order: [first, 1 - first], idx: 0, results: [null, null] };
@@ -2593,7 +2605,7 @@ const Engine = (() => {
   return {
     COLS, ROWS, CELLS, FAMS, POOL_SIZE, CFG, KINDS, JUNK, GEMS, OFFER, TIER_MULT, TIER_WEIGHT, TIER_NAME, AUGS, AUG_IDS, has, pickAug, augOffer, shredPrice, jackpotNeed, fuseNeed,
     offer, offerable, drawPool, costOf, units, mainFam, sellValue, addToBag, loose, golds, famCount, bagWeight, drawScreen, scoreScreen, playTurn,
-    newGame, startRound, chipsFor, shopper, upgradePrice, buy, reroll, lock, upgrade, sell, shred, cardsLeft, endShop,
+    newGame, startRound, chipsFor, shopper, shopDone, upgradePrice, buy, reroll, lock, upgrade, sell, shred, cardsLeft, endShop,
     spinner, damageFor, isOver, next, winner, catKnock, resolveClash,
   };
 })();
@@ -4915,6 +4927,9 @@ const CABS = (() => {
 
   /* ---------- the computer's seat ---------- */
   function isBot(p) { return !!(state && state.ai && p === 1); }
+  /* Whose store this phone shows: online, always this phone's seat (both shop at once); otherwise whoever's turn it is. */
+  function shopSeat() { return Net.active() ? Net.seat() : E.shopper(state); }
+  function shopWho() { return Net.active() ? Net.seat() : undefined; }
   /* The computer's store turn happens the moment it is up, before the screen is drawn; the news of what it did shows on the next screen. */
   function aiBefore() {
     if (!state || !state.ai || state.phase !== 'shop' || E.shopper(state) !== 1) return;
@@ -4939,7 +4954,7 @@ const CABS = (() => {
 
   /* ---------- scoreboard ---------- */
   function renderPlates(hit) {
-    const active = state.phase === 'shop' ? E.shopper(state) : state.phase === 'spin' ? E.spinner(state) : -1;
+    const active = state.phase === 'shop' ? (Net.active() ? (E.shopDone(state, Net.seat()) ? -1 : Net.seat()) : E.shopper(state)) : state.phase === 'spin' ? E.spinner(state) : -1;
     const plate = p => {
       const pl = state.players[p], h = ui.hearts[p];
       return '<div class="plate p' + p + (active === p ? ' active' : '') + '" data-plate="' + p + '"><span class="pname">' + esc(pl.name) + (isBot(p) ? '<span class="cpu">CPU</span>' : '') + (Net.active() && p !== Net.seat() ? '<span class="netdot' + (Net.peerHere() ? ' on' : '') + '" title="' + (Net.peerHere() ? 'Online' : 'Not connected') + '"></span>' : '') + '</span>' +
@@ -5028,7 +5043,7 @@ const CABS = (() => {
   /* The augment pick: three cards of one tier; tap one, confirm. */
   const TIER_NAME = { c: 'Common', r: 'Rare', l: 'Legendary' };
   function renderAugPick() {
-    const pi = E.shopper(state), me = state.players[pi], tier = E.AUGS[me.augOffer[0]].tier;
+    const pi = shopSeat(), me = state.players[pi], tier = E.AUGS[me.augOffer[0]].tier;
     const card = id => { const a = E.AUGS[id]; return '<button type="button" class="augcard tier-' + a.tier + (ui.augSel === id ? ' sel' : '') + '" data-aug="' + id + '"><span class="augicon">' + icon(a.icon) + '</span><b>' + a.name + '</b><span>' + a.text + '</span></button>'; };
     overlay.innerHTML = '<div class="card augpick tier-' + tier + '"><p class="label center">Round ' + state.round + ' · <span class="tiername">' + TIER_NAME[tier] + ' augment</span></p>' +
       '<h2><span class="who' + pi + '">' + esc(me.name) + '</span>, pick one</h2><p class="dsub">It stays with your machine for the rest of the game.</p>' +
@@ -5038,9 +5053,9 @@ const CABS = (() => {
   }
   function takeAug() {
     if (Tut.active()) setTimeout(() => Tut.on('augTake'), 0);
-    const me = state.players[E.shopper(state)];
+    const me = state.players[shopSeat()];
     if (!ui.augSel || !me.augOffer || me.augOffer.indexOf(ui.augSel) < 0) return;
-    const ev = E.pickAug(state, ui.augSel);
+    const ev = E.pickAug(state, ui.augSel, shopWho());
     Net.did('a' + ev.aug);
     const a = E.AUGS[ev.aug];
     ui.augSel = null; overlay.hidden = true; overlay.innerHTML = '';
@@ -5052,7 +5067,7 @@ const CABS = (() => {
     return '<span class="augbadges">' + pl.augs.map(id => '<span class="augbadge tier-' + E.AUGS[id].tier + '" title="' + E.AUGS[id].name + ': ' + E.AUGS[id].text + '">' + icon(E.AUGS[id].icon) + '<i>' + E.AUGS[id].name + '</i></span>').join('') + '</span>';
   }
   function renderShop() {
-    const pi = E.shopper(state), me = state.players[pi], opp = state.players[1 - pi];
+    const pi = shopSeat(), me = state.players[pi], opp = state.players[1 - pi];
     if (me.augOffer) { dressCabinet(pi); $('#screen').innerHTML = '<div class="store"></div>'; $('#mid').innerHTML = ''; $('#below').innerHTML = ''; $('#actions').innerHTML = ''; $('#marquee').innerHTML = '<span><span class="who' + pi + '">' + esc(me.name) + '</span> picks an augment</span>'; renderAugPick(); return; }
     $('#marquee').innerHTML = '<span><span class="who' + pi + '">' + esc(me.name) + '</span>’s store</span><span class="chips" title="Chips to spend">' + icon('chip') + '<b>' + me.chips + '</b></span>' + (me.bankChips ? '<span class="sub">+' + me.bankChips + ' from Bank</span>' : '');
     dressCabinet(pi); $('#cab').classList.add('shop');
@@ -5128,7 +5143,7 @@ const CABS = (() => {
 
   /* The first Mega: the cabinet powers down, rebuilds as the deluxe version, and the symbols come back re-skinned. */
   function megaShow(fam) {
-    const cab = $('#cab'), pi = E.shopper(state);
+    const cab = $('#cab'), pi = shopSeat();
     document.querySelectorAll('.megashow').forEach(n => n.remove());
     const d = document.createElement('div');
     d.className = 'megashow ' + fam;
@@ -5153,7 +5168,7 @@ const CABS = (() => {
   function doBuy() {
     if (ui.sel === null || state.phase !== 'shop') return;
     Sound.ensure();
-    const slotI = ui.sel, ev = E.buy(state, ui.sel);
+    const slotI = ui.sel, ev = E.buy(state, ui.sel, shopWho());
     if (!ev) { Sound.nope(); return; }
     Net.did('b' + slotI);
     ui.fresh = { p: ev.player, kind: ev.kind, tier: ev.fused };
@@ -5168,16 +5183,16 @@ const CABS = (() => {
   }
   function doSell() {
     if (!ui.sellSel || ui.sellSel.k === 'cards' || state.phase !== 'shop') return;
-    const me = state.players[E.shopper(state)];
+    const me = state.players[shopSeat()];
     const i = me.bag.findIndex(x => x.k === ui.sellSel.k && x.t === ui.sellSel.t);
-    const ev = i >= 0 ? E.sell(state, i) : null;
+    const ev = i >= 0 ? E.sell(state, i, shopWho()) : null;
     if (!ev) { Sound.nope(); return; }
     Net.did('s' + i);
     Sound.reroll(); ui.sellSel = null; ui.confirm = false; save(); renderPlates(); renderShop();
   }
   function doShred() {
     if (state.phase !== 'shop') return;
-    if (!E.shred(state)) { Sound.nope(); return; }
+    if (!E.shred(state, shopWho())) { Sound.nope(); return; }
     Net.did('x');
     Sound.shred(); shredAnim(); ui.confirm = false; save(); renderPlates(); renderShop(); Tut.on('shred');
   }
@@ -5192,11 +5207,11 @@ const CABS = (() => {
     const cab = $('#cab'); cab.classList.remove('jolt'); void cab.offsetWidth; cab.classList.add('jolt');
     setTimeout(() => { card.remove(); strips.remove(); sh.classList.remove('grind'); cab.classList.remove('jolt'); }, 1300);
   }
-  function doHold() { if (ui.sel === null || state.phase !== 'shop') return; if (E.lock(state, ui.sel)) { Net.did('l' + ui.sel); Sound.lock(); ui.confirm = false; save(); renderShop(); Tut.on('hold'); } }
+  function doHold() { if (ui.sel === null || state.phase !== 'shop') return; if (E.lock(state, ui.sel, shopWho())) { Net.did('l' + ui.sel); Sound.lock(); ui.confirm = false; save(); renderShop(); Tut.on('hold'); } }
   function doReroll() {
     if (state.phase !== 'shop') return;
     Sound.ensure();
-    if (!E.reroll(state, grng)) { Sound.nope(); return; }
+    if (!E.reroll(state, Net.active() ? Net.srng() : grng, shopWho())) { Sound.nope(); return; }
     Net.did('r');
     Sound.reroll(); ui.sel = null; ui.sellSel = null; ui.confirm = false; ui.dealt = true;
     if (Tut.active() && state.round === 2) { const p = state.players[0]; p.store = p.store.map((x, i) => x && x.locked ? x : { k: ['cherry', 'lemon', 'die', 'coin', 'ruby', 'bell', 'panda', 'seven', 'kitten', 'grapes'][i], locked: false }); }
@@ -5205,17 +5220,17 @@ const CABS = (() => {
   function doUpgrade() {
     if (state.phase !== 'shop') return;
     Sound.ensure();
-    if (!E.upgrade(state)) { Sound.nope(); return; }
+    if (!E.upgrade(state, shopWho())) { Sound.nope(); return; }
     Net.did('u');
     Sound.upgrade(); FX.confetti(30); ui.confirm = false; save(); renderPlates(); renderShop();
   }
   function doDone() {
     if (state.phase !== 'shop') return;
-    const me = state.players[E.shopper(state)];
+    const me = state.players[shopSeat()];
     const canSpend = me.chips >= CFG.rerollCost && !Tut.active();
     if (canSpend && !ui.confirm) { ui.confirm = true; Sound.nope(); renderShop(); return; }
     Sound.tap();
-    E.endShop(state);
+    E.endShop(state, shopWho());
     Net.did('d');
     ui.sel = null; ui.sellSel = null; ui.confirm = false; ui.peek = false; ui.dealt = true;
     save();
@@ -5302,7 +5317,7 @@ const CABS = (() => {
     if (Net.active() && !Net.replaying()) Net.did('p');
     const turn = E.playTurn(state, grng);
     save();
-    const btn = $('#btn-spin'); btn.className = 'btn big quiet'; btn.textContent = 'Tap to speed up';
+    const btn = $('#btn-spin'); btn.className = 'btn big quiet'; btn.textContent = Net.active() && pi !== Net.seat() ? me.name + ' is spinning…' : 'Tap to speed up';
     const cab = $('#cab'), marquee = $('#marquee'), meter = makeMeter($('#amount')), targetEl = $('#target'), multEl = $('#mult'), ticker = $('#ticker');
     const after = () => {
       if (!firstRes) return;
@@ -5699,7 +5714,7 @@ const CABS = (() => {
     Tut.before();
     aiBefore();
     renderPlates();
-    if (state.phase === 'shop' && Net.active() && E.shopper(state) !== Net.seat()) renderWait();
+    if (state.phase === 'shop' && Net.active() && E.shopDone(state, Net.seat())) renderWait();
     else if (state.phase === 'shop') renderShop();
     else if (state.phase === 'spin') renderSpin();
     else {
@@ -5899,14 +5914,14 @@ const CABS = (() => {
   })();
   /* ---------- the other player's store turn, watched from here ---------- */
   function renderWait() {
-    const pi = E.shopper(state), them = state.players[pi];
-    $('#marquee').innerHTML = '<span><span class="who' + pi + '">' + esc(them.name) + '</span>’s store</span><span class="sub">' + (Net.peerHere() ? 'shopping now' : 'not connected') + '</span>';
-    dressCabinet(pi); $('#cab').classList.add('shop', 'peek');
+    const me = Net.seat(), pi = 1 - me, them = state.players[pi];
+    $('#marquee').innerHTML = '<span>Waiting for <span class="who' + pi + '">' + esc(them.name) + '</span></span><span class="sub">' + (Net.peerHere() ? 'still shopping' : 'not connected') + '</span>';
+    dressCabinet(me); $('#cab').classList.add('shop', 'peek');
     const cards = them.store.map(() => '<div class="offer gone wait-slot" aria-hidden="true"></div>').join('');
     $('#screen').innerHTML = '<div class="store">' + cards + '</div>';
     reels = null;
-    $('#mid').innerHTML = '<div class="bags one">' + bagHTML(1 - pi, { active: false }) + '</div>';
-    $('#below').innerHTML = '<div class="detail wait"><div class="dbody"><p class="d1"><b>' + esc(them.name) + ' is shopping</b></p><p class="d0">You’ll see what they bought when they’re done. ' + (E.shopper(state) === state.shop.order[0] ? 'Then it’s your store.' : 'Then the spins start.') + '</p><p class="d2 waitdots"><i></i><i></i><i></i></p></div></div>';
+    $('#mid').innerHTML = '<div class="bags one">' + bagHTML(me, { active: true }) + '</div>';
+    $('#below').innerHTML = '<div class="detail wait"><div class="dbody"><p class="d1"><b>You’re done. ' + esc(them.name) + ' is still shopping</b></p><p class="d0">You’ll see what they bought when they finish, then the spins start.</p><p class="d2 waitdots"><i></i><i></i><i></i></p></div></div>';
     $('#actions').innerHTML = '<div class="two"><button class="btn" type="button" data-open="paytable">Rules</button><button class="btn" type="button" data-plate="' + pi + '">Augments</button></div>';
     aiNews();
     Net.drain();
@@ -5917,8 +5932,10 @@ const CABS = (() => {
      replay the same log through the same seeded rng, so they compute the same game; nothing bigger than the log ever travels.
      The log rides in each phone's room presence, so a reconnecting phone catches up from whatever its partner has. */
   const Net = (() => {
-    const KEY = 'jackpot-duel-net';
+    const KEY = 'jackpot-duel-net2';
     let net = null, nr = null, room = null, roomP = null, relayBroker = -1, unsub = [], queue = [], replayingNow = false, peerSeen = false, drainTimer = 0, lobbyTick = 0;
+    let srngs = [null, null];   // each seat's own reroll rng: the two stores never touch, so both players can shop at once
+    const SHOP = { b: 1, r: 1, l: 1, s: 1, x: 1, u: 1, a: 1, d: 1 };
     function seeded(a) { return function () { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
     const active = () => !!net;
     const seat = () => net ? net.seat : -1;
@@ -5935,9 +5952,11 @@ const CABS = (() => {
       })();
       return roomP;
     }
-    function store() { try { if (net) localStorage.setItem(KEY, JSON.stringify({ code: net.code, broker: net.broker, shown: net.shown, seed: net.seed, seat: net.seat, names: net.names, log: net.log, over: !!net.over })); else localStorage.removeItem(KEY); } catch (e) {} }
+    function store() { try { if (net) localStorage.setItem(KEY, JSON.stringify({ code: net.code, broker: net.broker, shown: net.shown, seed: net.seed, seat: net.seat, names: net.names, log: net.log, shops: net.shops, over: !!net.over })); else localStorage.removeItem(KEY); } catch (e) {} }
+    const packShops = sh => (sh || []).map(r => (r || []).join(',')).join('|');
+    const unpackShops = str => str ? str.split('|').map(r => (r ? r.split(',') : [])) : [];
     function saved() { try { const v = JSON.parse(localStorage.getItem(KEY)); return v && v.code && v.names ? v : null; } catch (e) { return null; } }
-    function publish() { if (!nr || !net) return; nr.presence({ v: 1, seat: net.seat, name: net.names[net.seat] || '', seed: net.seed || null, log: net.log.join(','), ready: net.ready === null || net.ready === undefined ? null : net.ready }).catch(() => {}); }
+    function publish() { if (!nr || !net) return; nr.presence({ v: 2, seat: net.seat, name: net.names[net.seat] || '', seed: net.seed || null, log: net.log.join(','), sh0: packShops(net.shops[0]), sh1: packShops(net.shops[1]), ready: net.ready === null || net.ready === undefined ? null : net.ready }).catch(() => {}); }
     function status(msg) { const el = $('#lobby-status'); if (el) el.innerHTML = msg; }
     /* The code the host reads out: the room key plus, on the relay, a digit for the broker it landed on, so the guest connects to the same one. */
     function shown() {
@@ -5985,7 +6004,7 @@ const CABS = (() => {
     }
     function onPeers(ch) {
       if (!net) return;
-      const partner = ch.peers.find(p => !p.sameTab && p.presence && p.presence.v === 1 && p.presence.seat === 1 - net.seat);
+      const partner = ch.peers.find(p => !p.sameTab && p.presence && p.presence.v === 2 && p.presence.seat === 1 - net.seat);
       const was = peerSeen; peerSeen = !!partner;
       if (!partner) { if (was && view === 'game') renderPlates(); if (!net.started) status(net.seat === 0 ? 'Waiting for a second player' + dots : 'Looking for the room' + dots); return; }
       const pr = partner.presence;
@@ -5994,6 +6013,7 @@ const CABS = (() => {
       if (net.seat === 1 && !net.seed && pr.seed) { net.seed = pr.seed; store(); }
       if (was !== peerSeen && view === 'game') renderPlates();
       merge(String(pr.log || ''));
+      mergeShops(unpackShops(String(pr.sh0 || '')), unpackShops(String(pr.sh1 || '')));
       net.peerReady = typeof pr.ready === 'number' ? pr.ready : null;
       if (net.seat === 0) hostNext();
     }
@@ -6007,6 +6027,57 @@ const CABS = (() => {
       }
       if (t.length > net.log.length) { for (let i = net.log.length; i < t.length; i++) { net.log.push(t[i]); queue.push(t[i]); } store(); drain(); }
     }
+    /* ---- the stores: one list of actions per seat per round; theirs we take as it grows, ours we keep ---- */
+    function mergeShops(sh0, sh1) {
+      const theirs = [sh0, sh1];
+      let changed = false;
+      for (const seat of [0, 1]) {
+        const t = theirs[seat] || [];
+        for (let r = 0; r < t.length; r++) {
+          const mine = net.shops[seat][r] || [];
+          if (seat === net.seat && mine.length) continue;              // our own store is ours
+          if (t[r].length > mine.length) { net.shops[seat][r] = t[r].slice(); changed = true; }
+        }
+      }
+      if (changed) { store(); applyShops(true); }
+    }
+    /* Bring the current round's stores up to date with what is known, animating only the other seat's news. */
+    function applyShops(live) {
+      if (!net || !state || state.phase !== 'shop') return;
+      const r = state.round;
+      for (const seat of [0, 1]) {
+        const acts = net.shops[seat][r - 1] || [];
+        let k = (net.applied[seat] || {})[r] || 0;
+        while (k < acts.length && state.phase === 'shop') { applyShop(seat, acts[k], live && seat !== net.seat); k++; }
+        net.applied[seat] = net.applied[seat] || {}; net.applied[seat][r] = k;
+      }
+      if (live && state.phase !== 'shop') { ui.sel = null; ui.sellSel = null; ui.confirm = false; ui.peek = false; ui.dealt = true; renderGame(); }
+    }
+    function applyShop(seat, a, live) {
+      const c = a[0], arg = a.slice(1), p = state.players[seat], theirs = seat !== net.seat;
+      const was = replayingNow; replayingNow = true;
+      try {
+        if (c === 'b') { const slot = p.store[+arg]; const ev = E.buy(state, +arg, seat); if (ev && theirs && live) { net.news = net.news || []; net.news.push(slot.k); if (ev.ascend || ev.mega) renderPlates(); } }
+        else if (c === 'r') { E.reroll(state, srng(seat), seat); if (theirs && live) net.rerolls = (net.rerolls || 0) + 1; }
+        else if (c === 'l') E.lock(state, +arg, seat);
+        else if (c === 's') E.sell(state, +arg, seat);
+        else if (c === 'x') { E.shred(state, seat); if (theirs && live) net.shreds = (net.shreds || 0) + 1; }
+        else if (c === 'u') { E.upgrade(state, seat); if (theirs && live) net.spins = (net.spins || 0) + 1; }
+        else if (c === 'a') { E.pickAug(state, arg, seat); if (theirs && live) net.aug = arg; }
+        else if (c === 'd') {
+          E.endShop(state, seat);
+          if (theirs && live) {
+            const bits = []; if (net.aug) bits.push('took <b>' + E.AUGS[net.aug].name + '</b>');
+            if (net.news && net.news.length) { const n = {}; net.news.forEach(k => { n[k] = (n[k] || 0) + 1; }); bits.push('bought ' + Object.keys(n).map(k => icon(k) + (n[k] > 1 ? '<small>×' + n[k] + '</small>' : '')).join('')); } else if (!net.aug) bits.push('bought nothing');
+            if (net.rerolls) bits.push('rerolled' + (net.rerolls > 1 ? ' ×' + net.rerolls : '')); if (net.shreds) bits.push('shredded ' + (net.shreds > 1 ? net.shreds + ' cards' : 'a card')); if (net.spins) bits.push('bought a spin');
+            toast('<b>' + esc(p.name) + '</b> is done · ' + bits.join(' · '));
+            if (state.phase === 'shop' && view === 'game') renderPlates();
+          }
+          if (theirs) { net.news = []; net.rerolls = 0; net.shreds = 0; net.spins = 0; net.aug = null; }
+        }
+      } finally { replayingNow = was; }
+    }
+    function srng(seat) { if (!srngs[seat]) srngs[seat] = seeded((net.seed * 31 + seat * 7919 + 17) | 0); return srngs[seat]; }
     /* ---- the clash handshake: both tap Next round; the host writes the round change once both are ready ---- */
     function ready() {
       if (!net || !state || state.phase !== 'clash') return;
@@ -6019,7 +6090,11 @@ const CABS = (() => {
       if (net.ready === net.log.length && net.peerReady === net.log.length) { net.ready = null; did('n'); apply('n', true); }
     }
     /* ---- actions ---- */
-    function did(a) { if (!net || replayingNow) return; net.log.push(a); net.ready = null; store(); publish(); }
+    function did(a) {
+      if (!net || replayingNow) return;
+      if (SHOP[a[0]] && state) { const r = state.round; const list = net.shops[net.seat][r - 1] = net.shops[net.seat][r - 1] || []; list.push(a); net.applied[net.seat] = net.applied[net.seat] || {}; net.applied[net.seat][r] = list.length; store(); publish(); if (a === 'd') applyShops(true); return; }
+      net.log.push(a); net.ready = null; store(); publish();
+    }
     function idle() { return !ui.busy && !(overlay.hidden === false && overlay.dataset.kind === 'clash' && $('#clash-next') && $('#clash-next').disabled && net.ready === null); }
     function drain() {
       if (!net) return;
@@ -6035,6 +6110,7 @@ const CABS = (() => {
       d.pool = E.drawPool(grng, d.bans); d.tiers = rollTiers();
       startGame(d.names, d.first, d.pool, d.bans, d.tiers);
       net.started = true; store();
+      applyShops(false);
       if (live) { Sound.fanfare(); draft = d; renderDraft(); } else draft = null;
     }
     /* One action, on the shared state. live = animate and render; otherwise just the rules, for catching up. */
@@ -6045,34 +6121,13 @@ const CABS = (() => {
     }
     function apply1(a, live) {
       const c = a[0], arg = a.slice(1);
-      if (c === 'g') { const parts = arg.split('|'); net.names = [parts[0] || 'Player 1', parts[1] || 'Player 2']; net.started = true; store(); grng = seeded(net.seed); draft = { names: net.names.slice(), first: net.seed % 2 === 1, bans: [], pool: null, who: 0, net: true }; if (live) { Sound.tap(); renderDraft(); } return; }
+      if (c === 'g') { const parts = arg.split('|'); net.names = [parts[0] || 'Player 1', parts[1] || 'Player 2']; net.started = true; store(); grng = seeded(net.seed); srngs = [null, null]; net.applied = net.applied || [{}, {}]; draft = { names: net.names.slice(), first: net.seed % 2 === 1, bans: [], pool: null, who: 0, net: true }; if (live) { Sound.tap(); renderDraft(); } return; }
       if (c === 'B') { if (!draft) return; const f = E.FAMS[+arg]; draft.bans.push(f); draft.who = 1 - draft.who; if (live) Sound.crush(); if (draft.bans.length === 2) finishDraft(live); else if (live) renderDraft(); return; }
       if (c === 'K') { if (!draft) return; finishDraft(live); return; }
       if (!state) return;
-      const pi = state.phase === 'shop' ? E.shopper(state) : state.phase === 'spin' ? E.spinner(state) : -1;
-      const mine = pi === net.seat;
-      if (c === 'b') { const slot = state.players[pi].store[+arg]; const ev = E.buy(state, +arg); if (ev && !mine && live) { net.news = net.news || []; net.news.push(slot.k); if (ev.ascend || ev.mega) renderPlates(); } return; }
-      if (c === 'r') { E.reroll(state, grng); if (!mine && live) net.rerolls = (net.rerolls || 0) + 1; return; }
-      if (c === 'l') { E.lock(state, +arg); return; }
-      if (c === 's') { E.sell(state, +arg); return; }
-      if (c === 'x') { E.shred(state); if (!mine && live) net.shreds = (net.shreds || 0) + 1; return; }
-      if (c === 'u') { E.upgrade(state); if (!mine && live) net.spins = (net.spins || 0) + 1; return; }
-      if (c === 'a') { E.pickAug(state, arg); if (!mine && live) net.aug = arg; return; }
-      if (c === 'd') {
-        const them = state.players[pi];
-        E.endShop(state);
-        if (!mine && live) {
-          const bits = []; if (net.aug) bits.push('took <b>' + E.AUGS[net.aug].name + '</b>');
-          if (net.news && net.news.length) { const n = {}; net.news.forEach(k => { n[k] = (n[k] || 0) + 1; }); bits.push('bought ' + Object.keys(n).map(k => icon(k) + (n[k] > 1 ? '<small>×' + n[k] + '</small>' : '')).join('')); } else if (!net.aug) bits.push('bought nothing');
-          if (net.rerolls) bits.push('rerolled' + (net.rerolls > 1 ? ' ×' + net.rerolls : '')); if (net.shreds) bits.push('shredded ' + (net.shreds > 1 ? net.shreds + ' cards' : 'a card')); if (net.spins) bits.push('bought a spin');
-          toast('<b>' + esc(them.name) + '</b> ' + bits.join(' · '));
-        }
-        net.news = []; net.rerolls = 0; net.shreds = 0; net.spins = 0; net.aug = null;
-        if (live) { ui.sel = null; ui.sellSel = null; ui.confirm = false; ui.peek = false; ui.dealt = true; renderGame(); }
-        return;
-      }
       if (c === 'p') {
         if (state.phase !== 'spin') return;
+        const mine = E.spinner(state) === net.seat;
         if (live) { if (!mine) { ui.peek = false; if (!$('#btn-spin') || ui.turnDone) renderGame(); doTurn(); } }
         else { const t = E.playTurn(state, grng); t.shown = true; }
         return;
@@ -6082,6 +6137,7 @@ const CABS = (() => {
         net.ready = null; net.peerReady = null;
         if (live) afterClash(); else { E.next(state, grng); ui.hearts = state.players.map(p => p.hearts); }
         if (state.phase === 'over') { net.over = true; store(); }
+        else applyShops(live);   // whatever the other phone already did in the new round's store
         return;
       }
     }
@@ -6089,7 +6145,7 @@ const CABS = (() => {
     function rebuild() {
       replayingNow = true;
       ++ui.token; ui.busy = false; ui.fast = false;
-      grng = seeded(net.seed); state = null; draft = null; view = 'title';
+      grng = seeded(net.seed); srngs = [null, null]; net.applied = [{}, {}]; state = null; draft = null; view = 'title';
       for (const a of net.log) apply(a, false);
       replayingNow = false;
       if (state) { ui.hearts = state.players.map(p => p.hearts); if (state.phase === 'clash' && state.clash && state.clash.winner >= 0) ui.hearts[1 - state.clash.winner] += state.clash.dmg; view = 'game'; overlay.hidden = true; overlay.innerHTML = ''; FX.clear(); renderGame(); }
@@ -6098,7 +6154,7 @@ const CABS = (() => {
     /* ---- entry points ---- */
     function create(name) {
       Sound.ensure(); name = (name || 'Player 1').slice(0, 10).replace(/[<>|,]/g, '');
-      net = { code: code4(), broker: undefined, shown: null, seed: 1 + Math.floor(Math.random() * 2000000000), seat: 0, names: [name, ''], log: [], ready: null, peerReady: null, started: false };
+      net = { code: code4(), broker: undefined, shown: null, seed: 1 + Math.floor(Math.random() * 2000000000), seat: 0, names: [name, ''], log: [], shops: [[], []], applied: [{}, {}], ready: null, peerReady: null, started: false };
       peerSeen = false; queue = []; store(); connect('host');
     }
     function join(name, code) {
@@ -6106,7 +6162,7 @@ const CABS = (() => {
       if (code.length < 4) return false;
       const broker = code.length === 5 ? +code[4] : undefined;
       if (code.length === 5 && !(broker >= 0 && broker < Relay.BROKERS.length)) return false;
-      net = { code: code.slice(0, 4), broker, shown: code, seed: null, seat: 1, names: ['', name], log: [], ready: null, peerReady: null, started: false };
+      net = { code: code.slice(0, 4), broker, shown: code, seed: null, seat: 1, names: ['', name], log: [], shops: [[], []], applied: [{}, {}], ready: null, peerReady: null, started: false };
       peerSeen = false; queue = []; store(); connect('guest'); return true;
     }
     function start() {   // the host starts: the names go into the log so both phones agree on them
@@ -6117,7 +6173,7 @@ const CABS = (() => {
     }
     function resume(sv) {
       Sound.ensure();
-      net = { code: sv.code, broker: typeof sv.broker === 'number' ? sv.broker : undefined, shown: sv.shown || null, seed: sv.seed, seat: sv.seat, names: sv.names, log: sv.log || [], ready: null, peerReady: null, started: !!(sv.log && sv.log.length), over: !!sv.over };
+      net = { code: sv.code, broker: typeof sv.broker === 'number' ? sv.broker : undefined, shown: sv.shown || null, seed: sv.seed, seat: sv.seat, names: sv.names, log: sv.log || [], shops: Array.isArray(sv.shops) && sv.shops.length === 2 ? sv.shops : [[], []], applied: [{}, {}], ready: null, peerReady: null, started: !!(sv.log && sv.log.length), over: !!sv.over };
       peerSeen = false; queue = [];
       if (net.started) { rebuild(); listen(); } else connect(net.seat === 0 ? 'host' : 'guest');
     }
@@ -6137,12 +6193,12 @@ const CABS = (() => {
       if (overlay.dataset.kind === 'clash' && !overlay.hidden) return true;
       if (overlay.dataset.kind === 'over' && !overlay.hidden) return true;
       if (overlay.dataset.kind === 'augs' || overlay.dataset.kind === 'paytable' || overlay.dataset.kind === 'builds') return true;
-      if (state.phase === 'shop') return E.shopper(state) === net.seat;
+      if (state.phase === 'shop') return !E.shopDone(state, net.seat);
       if (state.phase === 'spin') { const mine = E.spinner(state) === net.seat; if (t.closest('#btn-spin')) return mine || ui.turnDone; if (t.closest('#lever')) return mine; return mine || ui.turnDone; }
       return true;
     }
-    function debug() { return net ? { seat: net.seat, log: net.log.length, last: net.log.slice(-3), queue: queue.slice(), ready: net.ready, peerReady: net.peerReady, busy: ui.busy, turnDone: ui.turnDone, idle: idle(), phase: state ? state.phase : null } : null; }
-    return { active, seat, replaying, did, apply, drain, ready, allows, watching, peerHere, create, join, start, resume, quit, saved, debug };
+    function debug() { return net ? { seat: net.seat, log: net.log.length, last: net.log.slice(-3), shops: net.shops.map(x => x.length), queue: queue.slice(), ready: net.ready, peerReady: net.peerReady, busy: ui.busy, turnDone: ui.turnDone, idle: idle(), phase: state ? state.phase : null } : null; }
+    return { active, seat, replaying, did, apply, drain, ready, allows, watching, peerHere, create, join, start, resume, quit, saved, debug, srng: () => srng(net.seat) };
   })();
 
   /* ---------- events ---------- */
